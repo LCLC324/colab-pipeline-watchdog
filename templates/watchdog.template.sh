@@ -7,9 +7,12 @@
 # Mechanical checks only (state file + cron definitions + colab sessions);
 # this script never wakes an agent in real runs. On anomaly it sends a Slack
 # DM to the owner directly via the slack connector CLI, rate-limited to one
-# message per anomaly kind per 2h (history in hook_state). Every run records
-# its own heartbeat in hook_state under "${WATCHDOG_KEY_PREFIX}_heartbeat" (the
-# pipeline driver reads it for mutual monitoring). Silent when healthy.
+# message per anomaly kind per 2h (history in hook_state). Every completed
+# run records its own heartbeat in hook_state under
+# "${WATCHDOG_KEY_PREFIX}_heartbeat", written at the end of the run (after the
+# checks and notification attempts) so a fresh heartbeat means the run
+# finished end to end; the pipeline driver reads it for mutual
+# monitoring. Silent when healthy.
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -24,8 +27,15 @@ SLACK_BIN="/opt/hatch/bin/slack"
 COLAB_BIN="$HOME/workspace/colab-cli/venv/bin/colab"
 WATCHDOG_KEY_PREFIX="{{PROJECT_SLUG}}_watchdog"  # hook_state のキー接頭辞
 ALERT_INTERVAL_SEC=7200                        # 同種アラートの間隔（秒）
-DRIVER_STALE_MIN=45                            # ドライバ最終実行からこの分数で異常
+DRIVER_STALE_MIN=60                            # ドライバ最終実行からこの分数で異常
+PROGRESS_STALE_MIN=45                          # RUNNING 中の実験の last_progress_at がこの分数以上古いと異常
+SESSION_AGE_MAX_H=3                            # Colab セッション開始からこの時間を超えると異常（回収は約3.3時間）
+LEGIT_STOP_LONG_H=48                           # LEGIT_STOP の滞在がこの時間を超えると催促
+LOCK_STUCK_MIN=30                              # lock がこの分数以上保持されたままなら異常
 INSURANCE_ZIP_REQUIRED_FROM="{{INSURANCE_ZIP_REQUIRED_FROM}}"  # この日（YYYY-MM-DD）以降は成果物 zip 必須。空文字で無効
+# 締切前の LEGIT_STOP として正当な理由（legit_stop の値）。SUBMITTED は必ず含める
+# 例: '["SUBMITTED", "<人の判断待ちの理由1>", "<理由2>"]'
+LEGIT_STOP_OK_REASONS_JSON='{{LEGIT_STOP_OK_REASONS_JSON}}'
 TIMEZONE="Asia/Tokyo"
 # phase ごとの状態滞留の許容（分）。LEGIT_STOP と未知の phase は対象外
 STALL_ALLOWANCES_JSON='{"SETUP": 90, "RUNNING": 40, "COLLECT": 40, "SUMMARIZE": 60, "NEXT_DESIGN": 120}'
@@ -37,7 +47,9 @@ RUNNING_DWELL_BUFFER_MIN=60
 # ===== 設定欄ここまで =====
 
 export PROJECT_NAME PROJECT_SLUG WATCHDOG_KEY_PREFIX TIMEZONE DRIVER_STALE_MIN
-export INSURANCE_ZIP_REQUIRED_FROM STALL_ALLOWANCES_JSON DWELL_LIMITS_JSON
+export PROGRESS_STALE_MIN SESSION_AGE_MAX_H LEGIT_STOP_LONG_H LOCK_STUCK_MIN
+export INSURANCE_ZIP_REQUIRED_FROM LEGIT_STOP_OK_REASONS_JSON
+export STALL_ALLOWANCES_JSON DWELL_LIMITS_JSON
 export RUNNING_DWELL_FALLBACK_MIN RUNNING_DWELL_BUFFER_MIN DRIVER_DEF_GLOB
 
 DRY=0
@@ -47,14 +59,10 @@ now_epoch=$(date +%s)
 hook_state_raw="$(hook_state_get 2>/dev/null || echo '{}')"
 if [[ -z "$hook_state_raw" ]]; then hook_state_raw='{}'; fi
 
-# Heartbeat first (best-effort jq merge, same pattern as slack-yama-dispatch),
-# so liveness is recorded even if a later check fails.
-hb_key="${WATCHDOG_KEY_PREFIX}_heartbeat"
-hb_state="$(printf '%s' "$hook_state_raw" | jq --arg k "$hb_key" --argjson now "$now_epoch" '.[$k] = $now' 2>/dev/null || echo '')"
-if [[ -n "$hb_state" ]]; then
-    hook_state_set "$hb_state" 2>/dev/null || true
-    hook_state_raw="$hb_state"
-fi
+# NOTE: the heartbeat is intentionally NOT written here. It is merged
+# into hook_state at the end of the run (see the rate-limit/merge step
+# below), so a fresh heartbeat proves the run completed its checks and
+# notification attempts instead of merely having started.
 
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
@@ -69,9 +77,10 @@ fi
 
 # --- Checks 1/2/3/5: state stall, driver staleness, driver definition, ---
 # --- insurance zip. Pure file/JSON inspection in python.               ---
+check_rc=0
 STATE_FILE="$STATE_FILE" DRIVER_DEF_DIR="$DRIVER_DEF_DIR" NOW_EPOCH="$now_epoch" \
 CREATED_EPOCH="$created_epoch" \
-python3 - "$verdict" <<'PYEOF' || true
+python3 - "$verdict" <<'PYEOF' || check_rc=$?
 import glob, json, os, sys
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -82,7 +91,13 @@ created = int(os.environ.get("CREATED_EPOCH") or 0)
 state_path = os.environ["STATE_FILE"]
 state_name = os.path.basename(state_path)
 tz = ZoneInfo(os.environ.get("TIMEZONE") or "Asia/Tokyo")
-stale_min_limit = int(os.environ.get("DRIVER_STALE_MIN") or 45)
+driver_stale_min = int(os.environ.get("DRIVER_STALE_MIN") or 60)
+progress_stale_min = int(os.environ.get("PROGRESS_STALE_MIN") or 45)
+session_age_max_h = int(os.environ.get("SESSION_AGE_MAX_H") or 3)
+legit_stop_long_h = int(os.environ.get("LEGIT_STOP_LONG_H") or 48)
+lock_stuck_min = int(os.environ.get("LOCK_STUCK_MIN") or 30)
+legit_ok_reasons = tuple(json.loads(os.environ["LEGIT_STOP_OK_REASONS_JSON"]))
+driver_def_glob = os.environ["DRIVER_DEF_GLOB"]
 anomalies = []
 facts = {}
 
@@ -131,6 +146,34 @@ else:
     facts["session_name"] = (state.get("session") or {}).get("name")
     facts["drill"] = bool(state.get("watchdog_drill"))
 
+    # Retired pipeline (final submission done; the driver removes its
+    # own cron definition after setting this flag): skip every
+    # judgement, including the driver-definition check below -- but
+    # only when the state is consistent with a completed submission
+    # (phase=LEGIT_STOP with legit_stop=SUBMITTED). A retired flag in
+    # any other state is itself an anomaly and does not buy silence.
+    if state.get("retired") is True:
+        facts["retired"] = True
+        raw_retired_reason = state.get("legit_stop")
+        if isinstance(raw_retired_reason, dict):
+            retired_reason = raw_retired_reason.get("reason") or raw_retired_reason.get("kind")
+        else:
+            retired_reason = raw_retired_reason
+        if phase == "LEGIT_STOP" and retired_reason == "SUBMITTED":
+            out = {
+                "anomalies": [],
+                "facts": facts,
+                "session_check": False,
+                "session_name": "",
+            }
+            with open(verdict_path, "w") as f:
+                json.dump(out, f, ensure_ascii=False)
+            sys.exit(0)
+        anomalies.append({
+            "kind": "retired_inconsistent",
+            "detail": "retired不整合: retired=true だが phase=LEGIT_STOP かつ legit_stop=SUBMITTED の完了状態と一致しません",
+        })
+
     # Check 1: state stall, per-phase allowance in minutes (LEGIT_STOP and
     # unknown phases are not in the map and are skipped).
     allowances = json.loads(os.environ.get("STALL_ALLOWANCES_JSON") or "{}")
@@ -143,19 +186,19 @@ else:
                 "detail": f"状態滞留: phase={phase} のまま {age_min} 分経過（許容 {allowances[phase]} 分）",
             })
 
-    # Check 2: driver staleness (DRIVER_STALE_MIN). If the driver has never run, the
-    # reference point is the state file's creation time.
+    # Check 2: driver staleness (DRIVER_STALE_MIN). If the driver has never
+    # run, the reference point is the state file's creation time.
     drv = parse_ts(state.get("driver_last_run_at"))
     if drv is not None:
         age_min = (now - drv) // 60
-        if age_min >= stale_min_limit:
+        if age_min >= driver_stale_min:
             anomalies.append({
                 "kind": "driver_stale",
                 "detail": f"ドライバ停止の疑い: 最終実行から {age_min} 分経過",
             })
     elif created > 0:
         age_min = (now - created) // 60
-        if age_min >= stale_min_limit:
+        if age_min >= driver_stale_min:
             anomalies.append({
                 "kind": "driver_stale",
                 "detail": f"ドライバ停止の疑い: ドライバ未実行のまま状態ファイル作成から {age_min} 分経過",
@@ -165,8 +208,8 @@ else:
     # date (project timezone). Empty setting disables this check.
     izf = os.environ.get("INSURANCE_ZIP_REQUIRED_FROM") or ""
     if izf:
-        today = datetime.fromtimestamp(now, tz).date()
-        if artifacts.get("best_submission_zip") is None and today >= date.fromisoformat(izf):
+        today_local = datetime.fromtimestamp(now, tz).date()
+        if artifacts.get("best_submission_zip") is None and today_local >= date.fromisoformat(izf):
             anomalies.append({
                 "kind": "insurance_zip_missing",
                 "detail": f"保険zip未作成: best_submission_zip が null（{izf} 以降）",
@@ -190,20 +233,102 @@ else:
                 "kind": "phase_dwell",
                 "detail": f"フェーズ滞在超過: phase={phase} に {dwell_min} 分滞在（上限 {dwell_limits[phase]} 分）",
             })
-    
+
     # Additional check: LEGIT_STOP before the final deadline is itself
     # anomalous (the merge step notifies it once per LEGIT_STOP episode).
     if phase == "LEGIT_STOP":
         dl = parse_ts((state.get("deadline") or {}).get("final"))
         if dl is not None and now < dl:
+            raw_reason = state.get("legit_stop")
+            if isinstance(raw_reason, dict):
+                reason = raw_reason.get("reason") or raw_reason.get("kind")
+            else:
+                reason = raw_reason
+            if reason not in legit_ok_reasons:
+                anomalies.append({
+                    "kind": "legit_stop_early",
+                    "detail": "早期のLEGIT_STOP: 締切より前に phase=LEGIT_STOP へ遷移しています（正当な理由の記録なし）",
+                })
+
+    # Additional check: phase_since must exist. Without it the dwell
+    # judgement silently falls back to updated_at and phase stalls
+    # become invisible.
+    raw_ps = wave.get("phase_since")
+    wave_ps = parse_ts(raw_ps)
+    if raw_ps is None or (isinstance(raw_ps, str) and not raw_ps.strip()):
+        anomalies.append({
+            "kind": "phase_since_missing",
+            "detail": "phase_since欠落: wave.phase_since が無いため、フェーズ滞在判定の起点が記録されていません",
+        })
+    elif wave_ps is None:
+        anomalies.append({
+            "kind": "phase_since_missing",
+            "detail": f"phase_since欠落: wave.phase_since={raw_ps!r} を時刻として解釈できません",
+        })
+
+    # Additional check: LEGIT_STOP dwell cap (LEGIT_STOP_LONG_H). Even a
+    # legitimate stop gets a nudge when it drags on; a separate kind from
+    # legit_stop_early so it is not swallowed by the episode flag.
+    # Measured strictly from wave.phase_since (no updated_at fallback;
+    # a missing phase_since is reported by phase_since_missing above).
+    if phase == "LEGIT_STOP" and wave_ps is not None and now - wave_ps > legit_stop_long_h * 3600:
+        ls_dwell_min = (now - wave_ps) // 60
+        anomalies.append({
+            "kind": "legit_stop_long",
+            "detail": f"LEGIT_STOP長期化: LEGIT_STOP のまま {ls_dwell_min // 60} 時間経過（上限 {legit_stop_long_h} 時間）。判断待ちが長引いています",
+        })
+
+    # Additional check: RUNNING progress stall. A running experiment
+    # whose last_progress_at is PROGRESS_STALE_MIN+ min old is not
+    # advancing.
+    if phase == "RUNNING":
+        for exp in state.get("experiments") or []:
+            if not isinstance(exp, dict) or exp.get("status") != "running":
+                continue
+            lp = parse_ts(exp.get("last_progress_at"))
+            if lp is None:
+                continue
+            lp_age_min = (now - lp) // 60
+            if lp_age_min >= progress_stale_min:
+                anomalies.append({
+                    "kind": "progress_stale",
+                    "detail": f"進捗停滞: 実験 {exp.get('id')} の last_progress_at から {lp_age_min} 分経過（許容 {progress_stale_min} 分）",
+                })
+
+    # Additional check: Colab session age. Sessions are reaped at
+    # roughly 3.3h, so a session older than SESSION_AGE_MAX_H is living
+    # on borrowed time. Skipped while started_at is unknown.
+    sess = state.get("session") or {}
+    sess_started = parse_ts(sess.get("started_at"))
+    if sess_started is not None and now - sess_started > session_age_max_h * 3600:
+        sess_age_min = (now - sess_started) // 60
+        anomalies.append({
+            "kind": "session_age",
+            "detail": f"セッション長時間経過: セッション {sess.get('name')} が開始から {sess_age_min // 60} 時間 {sess_age_min % 60} 分経過（上限 {session_age_max_h} 時間）",
+        })
+
+    # Additional check: a lock held for LOCK_STUCK_MIN+ min means its
+    # holder died mid-run (the driver's own runs finish well within that).
+    lock_val = state.get("lock")
+    lock_ts = None
+    if isinstance(lock_val, dict):
+        for lock_key in ("at", "acquired_at", "since", "timestamp", "held_at"):
+            lock_ts = parse_ts(lock_val.get(lock_key))
+            if lock_ts is not None:
+                break
+    elif lock_val is not None:
+        lock_ts = parse_ts(lock_val)
+    if lock_ts is not None:
+        lock_age_min = (now - lock_ts) // 60
+        if lock_age_min >= lock_stuck_min:
             anomalies.append({
-                "kind": "legit_stop_early",
-                "detail": "早期のLEGIT_STOP: 締切より前に phase=LEGIT_STOP へ遷移しています",
+                "kind": "lock_stuck",
+                "detail": f"ロック残存: lock が {lock_age_min} 分保持されたままです（保持主体が途中で落ちた可能性）",
             })
-    
+
 # Check 3: driver cron definition exists and is enabled (independent of the
 # state file).
-defs = glob.glob(os.path.join(os.environ["DRIVER_DEF_DIR"], "*", os.environ["DRIVER_DEF_GLOB"]))
+defs = glob.glob(os.path.join(os.environ["DRIVER_DEF_DIR"], "*", driver_def_glob))
 enabled_found = False
 for path in defs:
     try:
@@ -219,7 +344,7 @@ for path in defs:
 if not defs or not enabled_found:
     anomalies.append({
         "kind": "driver_def_missing",
-        "detail": "ドライバ定義の消失: ドライバの cron 定義が無い、または enabled: true でない",
+        "detail": f"ドライバ定義の消失: {driver_def_glob} の cron 定義が無い、または enabled: true でない",
     })
 
 session_check = bool(state) and facts.get("phase") in ("SETUP", "RUNNING") \
@@ -234,9 +359,23 @@ with open(verdict_path, "w") as f:
     json.dump(out, f, ensure_ascii=False)
 PYEOF
 
-if [[ ! -f "$verdict" ]]; then
-    echo '{"anomalies": [], "facts": {}, "session_check": false, "session_name": ""}' > "$verdict"
-    log "state check failed; verdict defaulted" '{}'
+if [[ "$check_rc" -ne 0 || ! -f "$verdict" ]]; then
+    # The judgement itself failed: that is an anomaly, not "healthy".
+    python3 - "$verdict" <<'PYEOF' || true
+import json, sys
+out = {
+    "anomalies": [{
+        "kind": "watchdog_self_error",
+        "detail": "番犬の判定処理が失敗しました: 状態チェックが異常終了したため、この回は正常とみなしていません",
+    }],
+    "facts": {},
+    "session_check": False,
+    "session_name": "",
+}
+with open(sys.argv[1], "w") as f:
+    json.dump(out, f, ensure_ascii=False)
+PYEOF
+    log "state check failed; watchdog_self_error anomaly recorded" "{\"exit_code\": ${check_rc}}"
 fi
 
 # --- Check 4: Colab session presence (only while SETUP/RUNNING). ---
@@ -251,7 +390,7 @@ if [[ "$need_session" == "1" ]]; then
     set -e
     if [[ "$sessions_code" -ne 0 ]]; then
         log "session check inconclusive" "{\"exit_code\": ${sessions_code}}"
-    elif [[ -n "$session_name" && "$sessions_out" != *"$session_name"* ]]; then
+    elif [[ -n "$session_name" ]] && ! SESSIONS_OUT="$sessions_out" SESSION_NAME="$session_name" python3 -c 'import os,sys; name=os.environ.get("SESSION_NAME") or ""; out=os.environ.get("SESSIONS_OUT") or ""; tokens=out.replace("|", " ").replace("[", " ").replace("]", " ").split(); sys.exit(0 if name and name in tokens else 1)'; then
         python3 - "$verdict" "$session_name" <<'PYEOF' || true
 import json, sys
 path, name = sys.argv[1], sys.argv[2]
@@ -273,8 +412,8 @@ fi
 # legit_stop_early, which is sent once per LEGIT_STOP episode (flag in
 # hook_state, cleared when the phase leaves LEGIT_STOP). If the state file
 # carries watchdog_drill=true, the anomaly DM is prefixed with a drill
-# marker. Survival DM: once per JST date (last-sent date in hook_state).
-# Writes: $new_state (full hook_state incl. heartbeat and tentative send
+# marker. Survival DM: once per local date (last-sent date in hook_state).
+# Writes: $new_state (full hook_state incl. tentative send
 # records), $send_args / $alive_args (slack arguments-json, only when that
 # DM is due), $due_file / $count_file / $alive_file (shell control values).
 new_state="$workdir/new_state.json"
@@ -307,7 +446,6 @@ prefix = os.environ.get("WATCHDOG_KEY_PREFIX") or "watchdog"
 project = os.environ.get("PROJECT_NAME") or "pipeline"
 tz = ZoneInfo(os.environ.get("TIMEZONE") or "Asia/Tokyo")
 
-hook_state[f"{prefix}_heartbeat"] = now
 history = hook_state.get(f"{prefix}_alerts")
 if not isinstance(history, dict):
     history = {}
@@ -346,20 +484,20 @@ if due:
             if a["kind"] == "legit_stop_early":
                 hook_state[f"{prefix}_legit_stop_notified"] = True
             else:
-                history[a["kind" ]] = now
+                history[a["kind"]] = now
         hook_state[f"{prefix}_alerts"] = history
 
-# Survival DM: first run of each JST date.
-today_jst = datetime.fromtimestamp(now, tz).date().isoformat()
+# Survival DM: first run of each local date.
+today_local = datetime.fromtimestamp(now, tz).date().isoformat()
 alive_due = 0
-if hook_state.get(f"{prefix}_alive_date") != today_jst:
+if hook_state.get(f"{prefix}_alive_date") != today_local:
     alive_due = 1
     alive = {"channel_id": os.environ["OWNER_USER_ID"],
-            "message": f"【{project}番犬】番犬は正常に動いています（{today_jst}）"}
+            "message": f"【{project}番犬】番犬は正常に動いています（{today_local}）"}
     with open(alive_args_path, "w") as f:
         json.dump(alive, f, ensure_ascii=False)
     if not dry:
-        hook_state[f"{prefix}_alive_date"] = today_jst
+        hook_state[f"{prefix}_alive_date"] = today_local
 
 with open(new_state_path, "w") as f:
     json.dump(hook_state, f, ensure_ascii=False)
@@ -381,10 +519,10 @@ if [[ -f "$alive_file" ]]; then alive_due="$(cat "$alive_file")"; fi
 # Survival DM (real runs only). If the send fails, roll back the recorded
 # date so the next cycle retries.
 if [[ -f "$alive_args" && "$DRY" == "0" ]]; then
-    if ! "$SLACK_BIN" call-tool --name slack_send_message --arguments-json "$(cat "$alive_args")" >/dev/null 2>&1; then
+    if ! timeout 30 "$SLACK_BIN" call-tool --name slack_send_message --arguments-json "$(cat "$alive_args")" >/dev/null 2>&1; then
         log "alive DM send failed" '{}'
         if [[ -f "$new_state" ]]; then
-            WATCHDOG_KEY_PREFIX="$WATCHDOG_KEY_PREFIX" python3 - "$new_state" "$hook_state_raw" <<'PYEOF' || true
+            python3 - "$new_state" "$hook_state_raw" <<'PYEOF' || true
 import json, os, sys
 new_path, old_raw = sys.argv[1], sys.argv[2]
 ALIVE_KEY = (os.environ.get("WATCHDOG_KEY_PREFIX") or "watchdog") + "_alive_date"
@@ -411,10 +549,10 @@ fi
 # timestamps recorded above so the next cycle retries instead of waiting
 # out the 2h rate limit.
 if [[ -f "$send_args" && "$DRY" == "0" ]]; then
-    if ! "$SLACK_BIN" call-tool --name slack_send_message --arguments-json "$(cat "$send_args")" >/dev/null 2>&1; then
+    if ! timeout 30 "$SLACK_BIN" call-tool --name slack_send_message --arguments-json "$(cat "$send_args")" >/dev/null 2>&1; then
         log "slack DM send failed" "{\"due\": \"${due_csv}\"}"
         if [[ -f "$new_state" ]]; then
-            WATCHDOG_KEY_PREFIX="$WATCHDOG_KEY_PREFIX" python3 - "$new_state" "$hook_state_raw" <<'PYEOF' || true
+            python3 - "$new_state" "$hook_state_raw" <<'PYEOF' || true
 import json, os, sys
 new_path, old_raw = sys.argv[1], sys.argv[2]
 ALERTS_KEY = (os.environ.get("WATCHDOG_KEY_PREFIX") or "watchdog") + "_alerts"
@@ -437,8 +575,18 @@ PYEOF
     fi
 fi
 
+# Heartbeat: recorded last, after the checks and all notification
+# attempts, stamped with the completion time. If the merge step failed
+# and produced no new_state, fall back to the state read at start.
+hb_key="${WATCHDOG_KEY_PREFIX}_heartbeat"
+hb_epoch=$(date +%s)
 if [[ -f "$new_state" ]]; then
-    hook_state_set "$(cat "$new_state")" 2>/dev/null || true
+    final_state="$(jq --arg k "$hb_key" --argjson now "$hb_epoch" '.[$k] = $now' "$new_state" 2>/dev/null || echo '')"
+else
+    final_state="$(printf '%s' "$hook_state_raw" | jq --arg k "$hb_key" --argjson now "$hb_epoch" '.[$k] = $now' 2>/dev/null || echo '')"
+fi
+if [[ -n "$final_state" ]]; then
+    hook_state_set "$final_state" 2>/dev/null || true
 fi
 
 log "watchdog check" "{\"anomalies\": ${anomaly_count}, \"due\": \"${due_csv}\", \"dry_run\": ${DRY}, \"alive_due\": ${alive_due}}"
