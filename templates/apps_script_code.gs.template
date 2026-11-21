@@ -1,0 +1,81 @@
+// {{PROJECT_NAME}} 実験パイプライン外部見張り (Google Apps Script)
+//
+// 役割: Muse の VM / cron / hooks とは独立した Google 側の基盤で、
+// Drive 上の状態ファイルの「写し」を定期的に読み、鮮度が落ちていたら
+// メールで知らせるデッドマンスイッチ。VM 側が丸ごと止まっても、
+// 写しの更新が止まることで検知できる。
+//
+// 前提: パイプラインのドライバが、実行のたびに状態ファイルの写しを
+// Drive の STATE_FILE_ID のファイルへ上書きアップロードしていること。
+//
+// 差し替え欄: STATE_FILE_ID と ALERT_TO の2か所。
+// トリガー: 時間主導型で checkPipelineState を定期実行する
+// （例: 1時間おき。手順は SETUP_CHECKLIST.md を参照）。
+
+const STATE_FILE_ID = '{{DRIVE_STATE_FILE_ID}}'; // Drive 上の状態ファイル写し
+const ALERT_TO = '{{ALERT_EMAIL}}'; // 通知先メールアドレス
+
+const STATE_STALE_MIN = 60; // updated_at がこの分数を超えて古ければ異常
+const DRIVER_STALE_MIN = 75; // driver_last_run_at がこの分数を超えて古ければ異常
+const REALERT_HOURS = 3; // 同種の異常の再通知はこの時間あける
+
+function checkPipelineState() {
+const props = PropertiesService.getScriptProperties();
+let state = null;
+let fileUpdated = null;
+try {
+const file = DriveApp.getFileById(STATE_FILE_ID);
+fileUpdated = file.getLastUpdated();
+state = JSON.parse(file.getBlob().getDataAsString('UTF-8'));
+} catch (e) {
+alertOnce_(props, 'state_unreadable',
+'状態ファイルが読めません',
+'Drive 上の状態ファイル写しが見つからないか、JSON として読めません。\n' + e);
+return;
+}
+
+const now = new Date();
+const problems = [];
+
+// 状態ファイル自体の鮮度（ドライバが写しを上げ続けているか）
+const updatedAt = state.updated_at? new Date(state.updated_at): null;
+if (!updatedAt || (now - updatedAt) / 60000 > STATE_STALE_MIN) {
+problems.push('状態ファイルの更新が ' + STATE_STALE_MIN +
+' 分以上止まっています（最終更新: ' + state.updated_at + '）');
+}
+
+// ドライバの最終実行（ドライバ本体が動いているか）
+const drv = state.driver_last_run_at? new Date(state.driver_last_run_at): null;
+if (!drv || (now - drv) / 60000 > DRIVER_STALE_MIN) {
+problems.push('ドライバの最終実行が ' + DRIVER_STALE_MIN +
+' 分以上前です（最終実行: ' + state.driver_last_run_at + '）');
+}
+
+// 締切より前に LEGIT_STOP（正当な停止）へ入っていたら、それ自体が異常
+const phase = state.wave && state.wave.phase;
+if (phase === 'LEGIT_STOP' && state.deadline &&
+(new Date(state.deadline.final) - now) > 7 * 24 * 3600 * 1000) {
+problems.push('締切まで1週間以上あるのに LEGIT_STOP（正当な停止）に入っています。理由: ' +
+state.legit_stop);
+}
+
+if (problems.length) {
+alertOnce_(props, 'stale_' + phase,
+'実験パイプラインの停止を検知',
+'{{PROJECT_NAME}} の実験パイプラインに異常があります。\n\n' +
+problems.join('\n') +
+'\n\n現在の状態: wave=' + (state.wave && state.wave.id) + ' / phase=' + phase +
+'\n最良の指標: ' + (state.artifacts && state.artifacts.best_val) +
+'\nDrive ファイルの更新時刻: ' + fileUpdated);
+}
+}
+
+// 同種の異常は REALERT_HOURS 時間に1回まで。送信したら時刻を記録する。
+function alertOnce_(props, kind, subject, body) {
+const key = 'lastAlert_' + kind;
+const last = props.getProperty(key);
+const nowMs = Date.now();
+if (last && nowMs - Number(last) < REALERT_HOURS * 3600 * 1000) return;
+MailApp.sendEmail(ALERT_TO, subject, body);
+props.setProperty(key, String(nowMs));
+}
