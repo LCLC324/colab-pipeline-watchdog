@@ -26,7 +26,9 @@
       "local_metrics": "{{PROJECT_DIR_REL}}/{{WAVE_ID}}/{{EXP_ID_1}}/metrics.json",
       "retries": 0,
       "started_at": null,
-      "status": "pending"
+      "status": "pending",
+      "repair_tickets": 0,
+      "last_failure_sig": null
     },
     {
       "id": "{{EXP_ID_2}}",
@@ -35,7 +37,9 @@
       "local_metrics": "{{PROJECT_DIR_REL}}/{{WAVE_ID}}/{{EXP_ID_2}}/metrics.json",
       "retries": 0,
       "started_at": null,
-      "status": "pending"
+      "status": "pending",
+      "repair_tickets": 0,
+      "last_failure_sig": null
     }
   ],
   "known_expiries": {
@@ -53,7 +57,7 @@
     "local": "{{PRECHECK_RESULT_PATH}}",
     "status": "pending"
   },
-  "schema": 1,
+  "schema": 2,
   "session": {
     "max_age_h": 3.0,
     "name": "{{COLAB_SESSION_NAME}}",
@@ -70,5 +74,20 @@
     "file_id": "{{DRIVE_STATE_COPY_FILE_ID}}",
     "consecutive_failures": 0
   },
-  "retired": false
+  "retired": false,
+  "repair": {
+    "status": "idle",
+    "ticket": null,
+    "exp_id": null,
+    "since": null,
+    "deadline_at": null,
+    "heartbeat_at": null,
+    "agy_busy": false
+  },
+  "rerun_queue": [],
+  "repair_counters": {
+    "date": "{{CREATED_DATE}}",
+    "agy_calls": 0,
+    "tickets_this_wave": 0
+  }
 }

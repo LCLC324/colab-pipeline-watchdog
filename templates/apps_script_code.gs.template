@@ -8,16 +8,22 @@
 // 前提: パイプラインのドライバが、実行のたびに状態ファイルの写しを
 // Drive の STATE_FILE_ID のファイルへ上書きアップロードしていること。
 //
-// 差し替え欄: STATE_FILE_ID と ALERT_TO の2か所。
-// トリガー: 時間主導型で checkPipelineState を定期実行する
-// （例: 1時間おき。手順は SETUP_CHECKLIST.md を参照）。
+// 差し替え欄: STATE_FILE_ID、ALERT_TO、HEARTBEAT_FILE_NAME の3か所。
+// トリガー: 時間主導型で2本置く（手順は SETUP_CHECKLIST.md を参照）。
+//   - checkPipelineState: 定期実行（例: 1時間おき）
+//   - writeHeartbeat: 毎日1回。Drive の heartbeat ファイルに現在時刻を書き、
+//     ドライバ側が「外部の目（Apps Script）が生きているか」を逆向きに確かめる。
 
 const STATE_FILE_ID = '{{DRIVE_STATE_FILE_ID}}'; // Drive 上の状態ファイル写し
 const ALERT_TO = '{{ALERT_EMAIL}}'; // 通知先メールアドレス
+const HEARTBEAT_FILE_NAME = '{{APPS_SCRIPT_HEARTBEAT_FILE_NAME}}'; // 例: <project-slug>_appsscript_heartbeat.txt
 
 const STATE_STALE_MIN = 60; // updated_at がこの分数を超えて古ければ異常
 const DRIVER_STALE_MIN = 75; // driver_last_run_at がこの分数を超えて古ければ異常
 const REALERT_HOURS = 3; // 同種の異常の再通知はこの時間あける
+// 正当な停止の理由（legit_stop の値）。この理由での LEGIT_STOP は警告しない。
+// SUBMITTED は必ず含める。番犬の LEGIT_STOP_OK_REASONS_JSON と揃える。
+const LEGIT_STOP_OK_REASONS = {{LEGIT_STOP_OK_REASONS_JS_ARRAY}}; // 例: ['SUBMITTED', '<人の判断待ちの理由1>']
 
 function checkPipelineState() {
 const props = PropertiesService.getScriptProperties();
@@ -33,6 +39,9 @@ alertOnce_(props, 'state_unreadable',
 'Drive 上の状態ファイル写しが見つからないか、JSON として読めません。\n' + e);
 return;
 }
+
+// 退役済み（最終提出が終わり、ドライバが自身を削除した）なら何も判定しない
+if (state.retired) return;
 
 const now = new Date();
 const problems = [];
@@ -51,12 +60,18 @@ problems.push('ドライバの最終実行が ' + DRIVER_STALE_MIN +
 ' 分以上前です（最終実行: ' + state.driver_last_run_at + '）');
 }
 
-// 締切より前に LEGIT_STOP（正当な停止）へ入っていたら、それ自体が異常
+// 締切より前に LEGIT_STOP（正当な停止）へ入っていたら、それ自体が異常。
+// ただし理由が LEGIT_STOP_OK_REASONS のいずれか（人の判断待ち・提出済み）
+// なら正当なので警告しない。legit_stop は文字列か、reason / kind を持つ
+// オブジェクトのどちらでもよい。
 const phase = state.wave && state.wave.phase;
-if (phase === 'LEGIT_STOP' && state.deadline &&
+const ls = state.legit_stop;
+const lsReason = (ls && typeof ls === 'object')? (ls.reason || ls.kind): ls;
+const lsOk = LEGIT_STOP_OK_REASONS.indexOf(lsReason) >= 0 || state.retired === true;
+if (phase === 'LEGIT_STOP' && !lsOk && state.deadline &&
 (new Date(state.deadline.final) - now) > 7 * 24 * 3600 * 1000) {
 problems.push('締切まで1週間以上あるのに LEGIT_STOP（正当な停止）に入っています。理由: ' +
-state.legit_stop);
+(typeof ls === 'object'? JSON.stringify(ls): ls));
 }
 
 if (problems.length) {
@@ -78,4 +93,18 @@ const nowMs = Date.now();
 if (last && nowMs - Number(last) < REALERT_HOURS * 3600 * 1000) return;
 MailApp.sendEmail(ALERT_TO, subject, body);
 props.setProperty(key, String(nowMs));
+}
+
+// 外部の目の生存証明。Drive の HEARTBEAT_FILE_NAME に現在時刻の ISO 文字列を
+// 書く（既存があれば上書き、無ければマイドライブ直下に作成）。毎日1回の
+// 時間主導トリガーで呼ぶ。ドライバはこのファイルの更新時刻を1日1回確かめ、
+// 36時間以上更新が無ければ報告する。
+function writeHeartbeat() {
+const stamp = new Date().toISOString();
+const files = DriveApp.getFilesByName(HEARTBEAT_FILE_NAME);
+if (files.hasNext()) {
+files.next().setContent(stamp);
+} else {
+DriveApp.createFile(HEARTBEAT_FILE_NAME, stamp, MimeType.PLAIN_TEXT);
+}
 }

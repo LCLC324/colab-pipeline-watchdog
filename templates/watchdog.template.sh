@@ -13,6 +13,12 @@
 # checks and notification attempts) so a fresh heartbeat means the run
 # finished end to end; the pipeline driver reads it for mutual
 # monitoring. Silent when healthy.
+#
+# Autorepair (state schema 2): while state.repair is active and
+# fresh, progress_stale for repair.exp_id is suspended and the remaining
+# repair minutes are added to the stall/phase_dwell limits; new kinds
+# repair_overdue / repair_stale / repair_escalated (once per ticket) /
+# repairer_def_missing (self-arming, see check below).
 set -euo pipefail
 source "$HATCH_HOOK_RUNTIME"
 
@@ -22,6 +28,10 @@ PROJECT_SLUG="{{PROJECT_SLUG}}"
 STATE_FILE="{{STATE_FILE_PATH}}"
 DRIVER_DEF_DIR="{{DRIVER_DEF_DIR}}"            # ドライバ cron 定義の置き場所（goal の crons フォルダ）
 DRIVER_DEF_GLOB="{{DRIVER_CRON_ID}}*.md"       # ドライバ定義ファイルの glob
+REPAIR_DIR="{{REPAIR_DIR}}"                    # 修理の作業場所（tickets/ を含む）。例: <プロジェクト>/repair
+# 修理担当 cron 定義の投影ファイル（DRIVER_DEF_DIR からの相対パス）
+REPAIRER_DEF_REL="{{REPAIRER_DEF_REL}}"        # 例: minutely/<repairer-cron-id>__interval@15m.md
+REPAIR_FRESH_MIN=20                            # チケット更新がこの分数止まると repair_stale
 OWNER_USER_ID="{{OWNER_SLACK_USER_ID}}"        # 通知先の Slack ユーザーID
 SLACK_BIN="/opt/hatch/bin/slack"
 COLAB_BIN="$HOME/workspace/colab-cli/venv/bin/colab"
@@ -51,6 +61,7 @@ export PROGRESS_STALE_MIN SESSION_AGE_MAX_H LEGIT_STOP_LONG_H LOCK_STUCK_MIN
 export INSURANCE_ZIP_REQUIRED_FROM LEGIT_STOP_OK_REASONS_JSON
 export STALL_ALLOWANCES_JSON DWELL_LIMITS_JSON
 export RUNNING_DWELL_FALLBACK_MIN RUNNING_DWELL_BUFFER_MIN DRIVER_DEF_GLOB
+export REPAIR_DIR REPAIRER_DEF_REL REPAIR_FRESH_MIN
 
 DRY=0
 if [[ "${HATCH_HOOK_DRY_RUN:-0}" == "1" ]]; then DRY=1; fi
@@ -79,7 +90,7 @@ fi
 # --- insurance zip. Pure file/JSON inspection in python.               ---
 check_rc=0
 STATE_FILE="$STATE_FILE" DRIVER_DEF_DIR="$DRIVER_DEF_DIR" NOW_EPOCH="$now_epoch" \
-CREATED_EPOCH="$created_epoch" \
+CREATED_EPOCH="$created_epoch" HOOK_STATE_RAW="$hook_state_raw" \
 python3 - "$verdict" <<'PYEOF' || check_rc=$?
 import glob, json, os, sys
 from datetime import datetime, date
@@ -98,6 +109,8 @@ legit_stop_long_h = int(os.environ.get("LEGIT_STOP_LONG_H") or 48)
 lock_stuck_min = int(os.environ.get("LOCK_STUCK_MIN") or 30)
 legit_ok_reasons = tuple(json.loads(os.environ["LEGIT_STOP_OK_REASONS_JSON"]))
 driver_def_glob = os.environ["DRIVER_DEF_GLOB"]
+repair_fresh_min = int(os.environ.get("REPAIR_FRESH_MIN") or 20)
+prefix = os.environ.get("WATCHDOG_KEY_PREFIX") or "watchdog"
 anomalies = []
 facts = {}
 
@@ -174,16 +187,97 @@ else:
             "detail": "retired不整合: retired=true だが phase=LEGIT_STOP かつ legit_stop=SUBMITTED の完了状態と一致しません",
         })
 
+    # Repair context (schema 2). A repair is
+    # "active" while status is requested/in_progress/applied/verifying.
+    # The extension below applies only while the repair is active, before
+    # its deadline_at, and while its freshness source is <= REPAIR_FRESH_MIN old.
+    # Freshness source: the ticket file mtime (repair/tickets/<ticket>.json);
+    # while status=requested, the newer of that and repair.since. The extension
+    # never silences driver_stale, driver_def_missing, state_file_broken,
+    # session_age, session_missing, lock_stuck or insurance_zip_missing.
+    repair = state.get("repair") if isinstance(state.get("repair"), dict) else None
+    repair_status = (repair or {}).get("status")
+    repair_active = repair_status in ("requested", "in_progress", "applied", "verifying")
+    repair_extend = False
+    repair_exp = None
+    repair_remaining_min = 0
+    repair_fresh_age_min = None
+    if repair is not None:
+        facts["repair_status"] = repair_status
+        facts["repair_ticket"] = repair.get("ticket")
+    if repair_active:
+        repair_exp = repair.get("exp_id")
+        r_deadline = parse_ts(repair.get("deadline_at"))
+        r_since = parse_ts(repair.get("since"))
+        fresh_ts = None
+        ticket_id = repair.get("ticket")
+        if isinstance(ticket_id, str) and ticket_id and "/" not in ticket_id:
+            tpath = os.path.join(os.environ.get("REPAIR_DIR", ""), "tickets", ticket_id + ".json")
+            try:
+                fresh_ts = int(os.stat(tpath).st_mtime)
+            except OSError:
+                fresh_ts = None
+        # requested: the driver (re)issued the request at repair.since, so
+        # the newer of ticket mtime and since counts (a re-request after a
+        # failed verification keeps the old ticket file).
+        if repair_status == "requested" and r_since is not None:
+            fresh_ts = r_since if fresh_ts is None else max(fresh_ts, r_since)
+        if fresh_ts is not None:
+            repair_fresh_age_min = (now - fresh_ts) // 60
+        if r_deadline is not None and now < r_deadline \
+                and fresh_ts is not None and now - fresh_ts <= repair_fresh_min * 60:
+            repair_extend = True
+            repair_remaining_min = max(0, (r_deadline - now) // 60)
+        facts["repair_extend"] = repair_extend
+
+        # repair_overdue / repair_stale: the repairer's own work
+        # (requested/in_progress/applied). verifying is the driver's rerun
+        # and is watched by the normal progress checks instead.
+        if repair_status in ("requested", "in_progress", "applied"):
+            if r_deadline is None:
+                anomalies.append({
+                    "kind": "repair_overdue",
+                    "detail": f"修理期限不明: repair.status={repair_status} だが deadline_at が無い、または読めません（実験 {repair_exp}）",
+                })
+            elif now >= r_deadline:
+                anomalies.append({
+                    "kind": "repair_overdue",
+                    "detail": f"修理期限超過: 修理 {ticket_id or '(チケット未作成)'}（実験 {repair_exp}、status={repair_status}）が deadline_at を {(now - r_deadline) // 60} 分超過",
+                })
+            if fresh_ts is None:
+                anomalies.append({
+                    "kind": "repair_stale",
+                    "detail": f"修理停滞: repair.status={repair_status} だがチケットファイルが見つかりません（実験 {repair_exp}）",
+                })
+            elif now - fresh_ts > repair_fresh_min * 60:
+                what = "チケット未作成のまま依頼から" if (repair_status == "requested" and not ticket_id) else "チケットの最終更新から"
+                anomalies.append({
+                    "kind": "repair_stale",
+                    "detail": f"修理停滞: 修理 {ticket_id or '(未着手)'}（実験 {repair_exp}、status={repair_status}）が{what} {repair_fresh_age_min} 分経過（許容 {repair_fresh_min} 分）",
+                })
+
+    # repair_escalated: one DM per ticket (episode flag in hook_state,
+    # handled by the merge step via the "episode" key).
+    if repair_status == "escalated":
+        anomalies.append({
+            "kind": "repair_escalated",
+            "episode": str((repair or {}).get("ticket") or (repair or {}).get("since") or "unknown"),
+            "detail": f"自動修理の打ち切り（人の判断が必要）: 修理 {(repair or {}).get('ticket')}（実験 {(repair or {}).get('exp_id')}）が escalated になりました。repair/tickets/ のチケットを確認してください",
+        })
+
     # Check 1: state stall, per-phase allowance in minutes (LEGIT_STOP and
-    # unknown phases are not in the map and are skipped).
+    # unknown phases are not in the map and are skipped). While a repair
+    # extension is in effect, the remaining repair minutes are added.
     allowances = json.loads(os.environ.get("STALL_ALLOWANCES_JSON") or "{}")
     upd = parse_ts(state.get("updated_at"))
     if phase in allowances and upd is not None:
         age_min = (now - upd) // 60
-        if age_min > allowances[phase]:
+        allow = allowances[phase] + (repair_remaining_min if repair_extend else 0)
+        if age_min > allow:
+            ext_note = f"、修理延長 {repair_remaining_min} 分を含む" if repair_extend else ""
             anomalies.append({
                 "kind": "stall",
-                "detail": f"状態滞留: phase={phase} のまま {age_min} 分経過（許容 {allowances[phase]} 分）",
+                "detail": f"状態滞留: phase={phase} のまま {age_min} 分経過（許容 {allow} 分{ext_note}）",
             })
 
     # Check 2: driver staleness (DRIVER_STALE_MIN). If the driver has never
@@ -228,10 +322,12 @@ else:
             dwell_limits["RUNNING"] = int(os.environ.get("RUNNING_DWELL_FALLBACK_MIN") or 300)
     if phase in dwell_limits and entry is not None:
         dwell_min = (now - entry) // 60
-        if dwell_min > dwell_limits[phase]:
+        dwell_cap = dwell_limits[phase] + (repair_remaining_min if repair_extend else 0)
+        if dwell_min > dwell_cap:
+            ext_note = f"、修理延長 {repair_remaining_min} 分を含む" if repair_extend else ""
             anomalies.append({
                 "kind": "phase_dwell",
-                "detail": f"フェーズ滞在超過: phase={phase} に {dwell_min} 分滞在（上限 {dwell_limits[phase]} 分）",
+                "detail": f"フェーズ滞在超過: phase={phase} に {dwell_min} 分滞在（上限 {dwell_cap} 分{ext_note}）",
             })
 
     # Additional check: LEGIT_STOP before the final deadline is itself
@@ -284,6 +380,9 @@ else:
     if phase == "RUNNING":
         for exp in state.get("experiments") or []:
             if not isinstance(exp, dict) or exp.get("status") != "running":
+                continue
+            # The experiment under an extended repair is not judged here.
+            if repair_extend and repair_exp is not None and exp.get("id") == repair_exp:
                 continue
             lp = parse_ts(exp.get("last_progress_at"))
             if lp is None:
@@ -346,6 +445,44 @@ if not defs or not enabled_found:
         "kind": "driver_def_missing",
         "detail": f"ドライバ定義の消失: {driver_def_glob} の cron 定義が無い、または enabled: true でない",
     })
+
+# repairer_def_missing: the repairer's cron definition projection
+# (DRIVER_DEF_DIR/REPAIRER_DEF_REL) is missing or not enabled.
+# Self-arming: the check is armed only after the definition file has been
+# seen once (flag "<prefix>_repairer_seen" in hook_state, set by the merge
+# step), so it stays silent until the repairer cron is registered, and
+# alerts if it later disappears or is disabled. Skipped for schema-1 state
+# (no repair field), for a retired pipeline, and when REPAIRER_DEF_REL is
+# empty (autorepair not used).
+try:
+    _hs = json.loads(os.environ.get("HOOK_STATE_RAW") or "{}")
+    if not isinstance(_hs, dict):
+        _hs = {}
+except Exception:
+    _hs = {}
+rep_rel = os.environ.get("REPAIRER_DEF_REL") or ""
+if rep_rel:
+    rep_path = os.path.join(os.environ["DRIVER_DEF_DIR"], rep_rel)
+    rep_exists = os.path.isfile(rep_path)
+    rep_enabled = False
+    if rep_exists:
+        try:
+            with open(rep_path) as f:
+                for line in f:
+                    if line.strip() == "enabled: true":
+                        rep_enabled = True
+                        break
+        except Exception:
+            rep_enabled = False
+    facts["repairer_def"] = "enabled" if rep_enabled else ("disabled" if rep_exists else "absent")
+    if rep_exists:
+        facts["repairer_def_seen"] = True
+    rep_armed = bool(_hs.get(f"{prefix}_repairer_seen")) or rep_exists
+    if state is not None and isinstance(state.get("repair"), dict) and rep_armed and not rep_enabled:
+        anomalies.append({
+            "kind": "repairer_def_missing",
+            "detail": f"修理担当定義の消失: 修理担当の cron 定義（{rep_rel}）が無い、または enabled: true でない",
+        })
 
 session_check = bool(state) and facts.get("phase") in ("SETUP", "RUNNING") \
     and bool(facts.get("session_name"))
@@ -454,10 +591,24 @@ if not isinstance(history, dict):
 if facts.get("phase") != "LEGIT_STOP":
     hook_state.pop(f"{prefix}_legit_stop_notified", None)
 
+# repair_escalated is notified once per ticket: the notified ticket ids
+# are kept in hook_state (bounded to the latest 20).
+esc_notified = hook_state.get(f"{prefix}_repair_escalated_notified")
+if not isinstance(esc_notified, list):
+    esc_notified = []
+
+# Arm repairer_def_missing once the repairer definition has been seen.
+if facts.get("repairer_def_seen") and not dry:
+    hook_state[f"{prefix}_repairer_seen"] = True
+
 due = []
 for a in verdict.get("anomalies", []):
     if a["kind"] == "legit_stop_early":
         if not hook_state.get(f"{prefix}_legit_stop_notified"):
+            due.append(a)
+        continue
+    if a["kind"] == "repair_escalated":
+        if a.get("episode") not in esc_notified:
             due.append(a)
         continue
     last = history.get(a["kind"])
@@ -483,6 +634,9 @@ if due:
         for a in due:
             if a["kind"] == "legit_stop_early":
                 hook_state[f"{prefix}_legit_stop_notified"] = True
+            elif a["kind"] == "repair_escalated":
+                esc_notified = (esc_notified + [a.get("episode")])[-20:]
+                hook_state[f"{prefix}_repair_escalated_notified"] = esc_notified
             else:
                 history[a["kind"]] = now
         hook_state[f"{prefix}_alerts"] = history
@@ -556,6 +710,7 @@ if [[ -f "$send_args" && "$DRY" == "0" ]]; then
 import json, os, sys
 new_path, old_raw = sys.argv[1], sys.argv[2]
 ALERTS_KEY = (os.environ.get("WATCHDOG_KEY_PREFIX") or "watchdog") + "_alerts"
+ESC_KEY = (os.environ.get("WATCHDOG_KEY_PREFIX") or "watchdog") + "_repair_escalated_notified"
 try:
     new = json.load(open(new_path))
 except Exception:
@@ -568,6 +723,11 @@ if isinstance(old.get(ALERTS_KEY), dict):
     new[ALERTS_KEY] = old[ALERTS_KEY]
 else:
     new.pop(ALERTS_KEY, None)
+# Also roll back the once-per-ticket repair_escalated record.
+if isinstance(old.get(ESC_KEY), list):
+    new[ESC_KEY] = old[ESC_KEY]
+else:
+    new.pop(ESC_KEY, None)
 with open(new_path, "w") as f:
     json.dump(new, f, ensure_ascii=False)
 PYEOF

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# run_rerun.sh — {{PROJECT_NAME}} の1実験だけを Colab セッション内で単独に再実行する雛形
+# （自動修理フロー用。テンプレート: colab-pipeline-watchdog/templates/run_rerun.sh.template）
+#
+# 置き換え欄（{{...}} をプロジェクトの値にしてから {{REPAIR_DIR}}/run_rerun.sh として置く）:
+#   {{PROJECT_NAME}}        プロジェクト名（このコメント用）
+#   {{SESSION_WAVE_DIR}}    セッション内の波フォルダの既定値（例: /content/<wave.id>）。
+#                           実行時は環境変数 WAVE_DIR で上書きできる
+#   {{CHAIN_SCRIPT_REGEX}}  連結起動スクリプトを pgrep で見つける正規表現
+#                           （例: run_[a-z0-9]+_chain\.sh。repairer の {{CHAIN_SCRIPT_GLOB}} に対応）
+#
+# 使い方（セッション内で。起動してよいのはドライバだけ）:
+#   bash {{SESSION_WAVE_DIR}}/run_rerun.sh expN [スクリプトへの追加引数...]
+#   例: SMOKE=1 bash {{SESSION_WAVE_DIR}}/run_rerun.sh exp1        # スモーク（対応スクリプトのみ）
+#       bash {{SESSION_WAVE_DIR}}/run_rerun.sh exp1 --resume         # --resume 対応スクリプト
+# ドライバからは切り離して起動する:
+#   setsid nohup bash {{SESSION_WAVE_DIR}}/run_rerun.sh exp1 >/dev/null 2>&1 < /dev/null &
+#
+# 前提の配置（連結起動スクリプトと同じ。driver_body の標準に合わせる）:
+#   ${WAVE_DIR}/expN/expN.py を、cwd=${WAVE_DIR}/expN で実行し、
+#   ログは ${WAVE_DIR}/expN/train.log、成果は同フォルダの metrics.json。
+# 既存の train.log / metrics.json / error.json は消さずに attempts/<時刻>-<PID>/ へ退避する。
+# 記録は ${WAVE_DIR}/rerun.log に chain.log と同じ形式（START/END rc=）で残す。
+# ドライバは chain.log ではなく rerun.log の `END expN rc=X` を見て検証3を判定する。
+#
+# 終了コード: 2=引数不正 3=スクリプトなし 4=別の再実行が動作中 5=chain/他の実験が動作中
+#             97=cd 失敗 それ以外=実験スクリプトの終了コード
+set -u
+
+WAVE_DIR="${WAVE_DIR:-{{SESSION_WAVE_DIR}}}"
+CHAIN_SCRIPT_REGEX='{{CHAIN_SCRIPT_REGEX}}'
+RERUN_LOG="${WAVE_DIR}/rerun.log"
+LOCK_FILE="${WAVE_DIR}/.rerun.lock"
+
+EXP="${1:-}"
+if [[ ! "$EXP" =~ ^exp[0-9]+$ ]]; then
+  echo "usage: $0 expN [extra args...]" >&2
+  exit 2
+fi
+shift
+
+EXP_DIR="${WAVE_DIR}/${EXP}"
+SCRIPT="${EXP_DIR}/${EXP}.py"
+TRAIN_LOG="${EXP_DIR}/train.log"
+ts() { date -Iseconds; }
+
+if [[ ! -f "$SCRIPT" ]]; then
+  echo "[$(ts)] REFUSE ${EXP} reason=script_missing path=${SCRIPT}" >> "$RERUN_LOG"
+  exit 3
+fi
+
+# 1本ずつしか回さない（GPU の取り合いを防ぐ）
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "[$(ts)] REFUSE ${EXP} reason=another_rerun_running" >> "$RERUN_LOG"
+  exit 4
+fi
+
+# chain や他の実験が動いている間は起動しない（FORCE=1 で上書き可。通常は使わない）
+if [[ "${FORCE:-0}" != "1" ]]; then
+  if pgrep -f "$CHAIN_SCRIPT_REGEX" >/dev/null 2>&1 \
+     || pgrep -f "${WAVE_DIR}/exp[0-9]+/exp[0-9]+\.py" >/dev/null 2>&1; then
+    echo "[$(ts)] REFUSE ${EXP} reason=chain_or_experiment_running" >> "$RERUN_LOG"
+    exit 5
+  fi
+fi
+
+# 前回の成果を退避（消さない）
+ATT_DIR="${EXP_DIR}/attempts/$(date +%Y%m%dT%H%M%S)-$$"
+mkdir -p "$ATT_DIR"
+for f in train.log metrics.json error.json; do
+  [[ -f "${EXP_DIR}/${f}" ]] && mv "${EXP_DIR}/${f}" "${ATT_DIR}/${f}"
+done
+
+echo "[$(ts)] START ${EXP} rerun PID=$$ smoke=${SMOKE:-0} args=$* sha=$(sha256sum "$SCRIPT" | cut -c1-12)" >> "$RERUN_LOG"
+cd "$EXP_DIR" || { echo "[$(ts)] END ${EXP} rc=97 reason=cd_failed" >> "$RERUN_LOG"; exit 97; }
+python3 -u "$SCRIPT" "$@" > "$TRAIN_LOG" 2>&1
+RC=$?
+echo "[$(ts)] END ${EXP} rc=${RC}" >> "$RERUN_LOG"
+exit "$RC"

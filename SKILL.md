@@ -1,6 +1,6 @@
 ---
 name: colab-pipeline-watchdog
-description: Set up a reusable monitoring kit for long-running, deadline-bound Colab work — a state file as the single source of truth, one persistent LLM driver cron that advances the pipeline one step at a time, an LLM-free watchdog hook that alerts on stalls, and a Google Apps Script dead man's switch on Drive. Generalized from the DLBasics2026 EEG pipeline (2026-11-21). Use when starting a Colab-based project that runs for hours to weeks with a hard deadline (competition training waves, thesis experiments), or when a long background Colab job must not stall silently. Do NOT use for one-off jobs that finish in minutes.
+description: Set up a reusable monitoring kit for long-running, deadline-bound Colab work — a state file as the single source of truth, one persistent LLM driver cron that advances the pipeline one step at a time, an LLM-free watchdog hook that alerts on stalls, a Google Apps Script dead man's switch on Drive (with its own heartbeat), and an optional bounded autorepair cron for crashed experiments. Generalized from the DLBasics2026 EEG pipeline (2026-11-21). Use when starting a Colab-based project that runs for hours to weeks with a hard deadline (competition training waves, thesis experiments), or when a long background Colab job must not stall silently. Do NOT use for one-off jobs that finish in minutes.
 ---
 
 # Colab pipeline watchdog: state file + single driver + LLM-free watchdog + external eye
@@ -27,7 +27,7 @@ common type: **survival depended on a single deletable thing, chaining
 was edge-triggered, and checks verified existence instead of progress.**
 Every part below exists to kill one of those causes.
 
-## Architecture (4 parts)
+## Architecture (4 parts + optional autorepair)
 
 1. **State file** (`pipeline_state.json`, template:
    `templates/pipeline_state.template.json`) — the single source of
@@ -41,7 +41,10 @@ Every part below exists to kill one of those causes.
    current `deadline.mode` (NORMAL / FREEZE / DEGRADED), best artifact,
    precheck result, the Drive copy (`drive_copy.file_id`,
    `consecutive_failures`), a lock, the driver's last-run timestamp,
-   and a `retired` flag for the end of the project. All coordination
+   and a `retired` flag for the end of the project. Schema 2 adds the
+   autorepair fields (`repair`, `rerun_queue`, `repair_counters`, and
+   per-experiment `repair_tickets` / `last_failure_sig`); keep them even
+   if autorepair is not used (an idle `repair` is inert). All coordination
    goes through this file; nothing coordinates by chat messages or by
    a job's prose alone.
 2. **Single persistent driver** (cron, interval 15m; body template:
@@ -81,17 +84,80 @@ Every part below exists to kill one of those causes.
    the run completed); the driver checks that heartbeat in return
    (mutual monitoring). Once the state says retired + LEGIT_STOP +
    SUBMITTED it goes silent. The watchdog never restarts anything — it
-   only detects and tells.
+   only detects and tells. With autorepair enabled it also knows the
+   repair context: while a repair is active, before its `deadline_at`,
+   and its ticket was updated within 20 min, progress staleness for the
+   experiment under repair is suspended and the remaining repair minutes
+   are added to the stall / dwell limits (never to driver staleness,
+   lock, session, state-file or insurance checks). It adds
+   `repair_overdue` (past `deadline_at`), `repair_stale` (ticket not
+   updated for 20 min), `repair_escalated` (one DM per ticket — the only
+   DM for an escalation), and `repairer_def_missing` (self-arming: silent
+   until the repairer definition has been seen once).
 4. **External eye** (Google Apps Script; code template:
    `templates/apps_script_code.gs.template`) — runs on Google's
    infrastructure, independent of the VM, the cron platform, and the
    LLM. A time-driven trigger reads the state-file copy on Drive and
    emails the owner if `updated_at` is stale by 60+ min,
    `driver_last_run_at` by 75+ min, or LEGIT_STOP was entered more
-   than a week before the deadline. If everything on the VM side dies
+   than a week before the deadline — unless the recorded reason (a
+   string, or an object's `reason` / `kind`) is in the allowed list or
+   the state is `retired`; once `retired` is true it skips every check.
+   A second, daily trigger runs `writeHeartbeat()`, which writes the
+   current ISO time into a small Drive file; the driver checks that
+   file's update time once a day and reports if it is 36+ h old, so the
+   external eye is itself watched. If everything on the VM side dies
    at once, the Drive copy stops advancing and this still fires. This
    is the closest thing to a true dead man's switch available without
    registering a new external service.
+
+5. **Autorepair (optional; repairer body template:
+   `templates/repairer_body.template.md`)** — a *separate* cron
+   (interval 15m, offset from the driver) that fixes crashed experiment
+   scripts under hard limits. Roles and boundaries:
+   - **Driver** detects the failure (`END expN rc≠0` in chain.log /
+     rerun.log without a completion marker in metrics.json), saves an
+     evidence bundle to `repair/inbox/`, and sets
+     `repair.status=requested` in the state file. It remains the only
+     writer of the state file and the only actor that touches the Colab
+     session: after the repairer marks a ticket `applied`, the driver
+     uploads the fixed files (sha256-checked), queues the experiment in
+     `rerun_queue`, starts it with `run_rerun.sh` once the chain is
+     idle, and confirms it on the real rerun (verification 3: epochs
+     past the failure point → `verified`; another crash → hands the
+     ticket back).
+   - **Repairer** writes only `repair/tickets/<id>.json` (tmp → parse →
+     mv), its own `repair/<id>/` folder, and its lock. It classifies
+     mechanically: **B** (auto-fix: a plain bug — NameError, KeyError,
+     shape mismatch… — in an allow-listed own script) → asks agy for a
+     unified diff only (resumes the project's implementation
+     conversation; primary model Neon, one fallback try on agy's Claude
+     Opus 5.5 Medium; no tools); **B'** (prescription only: CUDA OOM,
+     second DataLoader hang, missing pip module) → a fixed recipe;
+     **C** (escalate to a human: auth, quota, NaN/divergence, frames
+     outside the allow list, near the deadline, limits hit,
+     unclassifiable). Every diff passes a mechanical gate (allow-listed
+     paths, ≤80 changed lines, forbidden words such as test / label /
+     split / seed / submission, metrics keys preserved, `patch
+     --dry-run`), then verification 1 (`py_compile` / `bash -n`) and 2
+     (`SMOKE=1` run when the script and local torch allow it).
+     Backups in `repair/<id>/before/` with sha256; any failure restores
+     them.
+   - **Limits:** 2 tickets per experiment, 4 per wave, 6 agy calls per
+     day, 60 min per ticket, 2 attempts per ticket; no new requests in
+     FREEZE or after the cutoff before the freeze date. The watchdog
+     extension rules above use the same limits — change all three
+     together.
+   - **Required script spec for new waves** (written into every brief
+     by the driver at NEXT_DESIGN): `SMOKE=1` mode, per-epoch
+     `ckpt_last.pt` + `--resume`, the `/content/<wave>/expN/expN.py`
+     layout runnable via `run_rerun.sh expN`, and a machine-written
+     `error.json` on failure. `run_rerun.sh` (single-experiment rerun
+     with flock, refuse-while-chain-runs, previous train.log /
+     metrics.json / error.json moved to `attempts/`, START/END rc= lines
+     in rerun.log, extra args passed through to the experiment script)
+     comes from `templates/run_rerun.sh.template`; fill its `{{...}}`
+     (session wave dir, chain-script regex) per project.
 
 ## Setup
 
@@ -114,8 +180,15 @@ Follow `templates/SETUP_CHECKLIST.md` in order:
    (`drive_copy.file_id`; the driver body reads it from there) and
    into the Apps Script; create the Apps Script project, set the
    time-driven trigger, approve permissions, confirm the Drive copy's
-   timestamp tracks driver runs.
-6. Confirm both daily survival signals arrive once (driver line to the
+   timestamp tracks driver runs. Add a second, daily trigger for
+   `writeHeartbeat`, run it once by hand, and confirm the heartbeat
+   file (`{{APPS_SCRIPT_HEARTBEAT_FILE_NAME}}`) appears on Drive.
+6. (Optional) Autorepair: fill `templates/run_rerun.sh.template` and put
+   it under `repair/` as `run_rerun.sh` (`bash -n` it), create
+   `repair/{inbox,tickets}/`, register the repairer cron from
+   `templates/repairer_body.template.md` offset from the driver, and set
+   the watchdog's `REPAIR_DIR` / `REPAIRER_DEF_REL`.
+7. Confirm both daily survival signals arrive once (driver line to the
    report chat, watchdog DM to the owner). From then on, a missing
    survival signal is itself the alarm.
 
@@ -131,7 +204,13 @@ and Apps Script — note the Apps Script template calls it
 `{{DRIVE_STATE_FILE_ID}}`; use the same value), and
 `{{LEGIT_STOP_REASON_CODES}}` (driver body) which must all appear,
 together with SUBMITTED, in the watchdog's
-`{{LEGIT_STOP_OK_REASONS_JSON}}`. Deadline dates live only in the
+`{{LEGIT_STOP_OK_REASONS_JSON}}` and the Apps Script's
+`{{LEGIT_STOP_OK_REASONS_JS_ARRAY}}`. For autorepair,
+`{{REPAIR_DIR}}` / `{{REPAIR_DIR_REL}}`, `{{REPAIRER_CRON_ID}}`
+(driver body, repairer frontmatter, watchdog `REPAIRER_DEF_REL`) and
+`{{REPAIR_CUTOFF_NOTE}}` (driver and repairer) must agree, and
+`{{APPS_SCRIPT_HEARTBEAT_FILE_NAME}}` must match between the Apps
+Script and the driver body. Deadline dates live only in the
 state file; the driver body refers to `deadline.*` instead of
 repeating them.
 
@@ -154,7 +233,11 @@ otherwise be perfectly silent.
   (including the missing driver definition) and stays silent; a
   `retired` flag in any other state raises `retired_inconsistent`.
   Disable the hook once it has gone quiet after the project ends.
-- Apps Script: delete the time-driven trigger after the project ends.
+- Repairer: once the driver has retired, disable or remove the
+  repairer cron (it never self-removes; with `repair` idle it does
+  nothing).
+- Apps Script: on `retired` it stops judging; delete both time-driven
+  triggers (check + heartbeat) after the project ends.
 - Keep the state file and results in the project folder as the record.
 
 ## Lessons baked in (measured, 2026-11-20/21)
