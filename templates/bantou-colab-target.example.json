@@ -1,0 +1,51 @@
+{
+  "id": "colab-sample",
+  "description": "番頭 Colab 作業者アダプタの対象設定サンプル（共有番犬 agy-delegation-watchdog 用）",
+  "enabled": true,
+  "state_file": "~/workspace/<project>/state.json",
+  "driver_def": "~/bantou/crons/minutely/colab-sample-driver__interval@10m.md",
+  "driver_body_file": "~/bantou/crons/minutely/colab-sample-driver__interval@10m.md",
+  "driver_cron_id": "colab-sample-driver",
+  "recovery_doc": "~/bantou/DESIGN.md",
+  "terminal_phases": [
+    "done",
+    "failed"
+  ],
+  "driver_stale_min": 25,
+  "work_stale_min": 45,
+  "wake_cooldown_min": 20,
+  "max_revives": 3,
+  "phases": {
+    "setup": {
+      "progress_paths": [
+        "~/workspace/<project>/logs/setup.log",
+        "~/workspace/<project>/results"
+      ]
+    },
+    "running": {
+      "progress_paths": [
+        "~/workspace/<project>/logs/train_mirror.log",
+        "~/workspace/<project>/results"
+      ]
+    },
+    "collect": {
+      "progress_paths": [
+        "~/workspace/<project>/results",
+        "~/workspace/<project>/logs/collect.log"
+      ]
+    },
+    "summarize": {
+      "progress_paths": [
+        "~/workspace/<project>/results",
+        "~/workspace/<project>/insurance",
+        "~/workspace/<project>/ledger.md"
+      ]
+    },
+    "next_design": {
+      "progress_paths": [
+        "~/workspace/<project>/logs/worker.log",
+        "~/workspace/<project>/briefs"
+      ]
+    }
+  }
+}

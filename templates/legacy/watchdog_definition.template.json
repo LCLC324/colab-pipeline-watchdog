@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "{{WATCHDOG_HOOK_ID}}",
+  "enabled": true,
+  "script_path": "~/hooks/scripts/{{WATCHDOG_HOOK_ID}}.sh",
+  "prompt": "あなたは {{PROJECT_NAME}} 実験パイプライン番犬フック（{{WATCHDOG_HOOK_ID}}）の予備の受け手です。このフックは通常 wake しません。異常の通知はスクリプト自身が Slack DM でオーナーに直接送り、生存通知も1日1回スクリプトが送ります。dry-run 以外で wake された場合は、payload の内容を短くこのチャットに報告してください。実験・セッション・状態ファイルは自分で操作しないでください。",
+  "poll_interval_secs": 60,
+  "script_timeout_secs": 300,
+  "delivery": {
+    "surface": "main"
+  },
+  "presentation_locale": "ja-JP"
+}

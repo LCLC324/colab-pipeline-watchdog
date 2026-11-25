@@ -1,93 +1,51 @@
 {
-  "alerts": {
-    "last_kind": null,
-    "last_sent_at": null
-  },
-  "artifacts": {
-    "best_model": "{{BEST_MODEL_PATH}}",
-    "best_submission_zip": null,
-    "best_val": null,
-    "zip_updated_at": null
-  },
-  "deadline": {
-    "final": "{{DEADLINE_FINAL_ISO8601}}",
-    "freeze": "{{FREEZE_DATE}}",
-    "mode": "NORMAL",
-    "point_of_no_return": "{{POINT_OF_NO_RETURN_DATE}}",
-    "submit_target": "{{SUBMIT_TARGET_DATE}}",
-    "rehearsal": "{{REHEARSAL_DEADLINE_DATE}}"
-  },
-  "driver_last_run_at": null,
-  "experiments": [
-    {
-      "id": "{{EXP_ID_1}}",
-      "last_epoch": null,
-      "last_progress_at": null,
-      "local_metrics": "{{PROJECT_DIR_REL}}/{{WAVE_ID}}/{{EXP_ID_1}}/metrics.json",
-      "retries": 0,
-      "started_at": null,
-      "status": "pending",
-      "repair_tickets": 0,
-      "last_failure_sig": null
-    },
-    {
-      "id": "{{EXP_ID_2}}",
-      "last_epoch": null,
-      "last_progress_at": null,
-      "local_metrics": "{{PROJECT_DIR_REL}}/{{WAVE_ID}}/{{EXP_ID_2}}/metrics.json",
-      "retries": 0,
-      "started_at": null,
-      "status": "pending",
-      "repair_tickets": 0,
-      "last_failure_sig": null
-    }
-  ],
-  "known_expiries": {
-    "{{EXPIRY_NAME_1}}": "{{EXPIRY_DATE_1}}",
-    "warn_from": "{{EXPIRY_WARN_FROM_DATE}}"
-  },
-  "legit_stop": null,
+  "phase": "setup",
+  "attempts": 0,
+  "worker_unit": "bantou-<id>.service",
+  "worker_pid": null,
+  "driver_heartbeat_epoch": null,
+  "last_restart_epoch": null,
+  "note": null,
+  "watchdog_issue": null,
+  "updated_at": "<CREATED_AT_ISO8601>",
   "lock": null,
-  "next_wave": {
-    "brief": "{{NEXT_WAVE_BRIEF_PATH}}",
-    "id": "{{NEXT_WAVE_ID}}",
-    "ready": false
-  },
-  "precheck": {
-    "local": "{{PRECHECK_RESULT_PATH}}",
-    "status": "pending"
-  },
-  "schema": 2,
-  "session": {
-    "max_age_h": 3.0,
-    "name": "{{COLAB_SESSION_NAME}}",
-    "started_at": null
-  },
-  "updated_at": "{{CREATED_AT_ISO8601}}",
-  "wave": {
-    "id": "{{WAVE_ID}}",
-    "phase": "SETUP",
-    "phase_since": "{{CREATED_AT_ISO8601}}",
-    "setup_failures": 0
-  },
-  "drive_copy": {
-    "file_id": "{{DRIVE_STATE_COPY_FILE_ID}}",
-    "consecutive_failures": 0
-  },
-  "retired": false,
-  "repair": {
-    "status": "idle",
-    "ticket": null,
-    "exp_id": null,
-    "since": null,
-    "deadline_at": null,
-    "heartbeat_at": null,
-    "agy_busy": false
-  },
-  "rerun_queue": [],
-  "repair_counters": {
-    "date": "{{CREATED_DATE}}",
-    "agy_calls": 0,
-    "tickets_this_wave": 0
+  "colab": {
+    "wave_id": "<wave_id>",
+    "phase_since": "<CREATED_AT_ISO8601>",
+    "session_name": "<colab_session>",
+    "session_started_at": null,
+    "session_max_age_h": 3.0,
+    "drive_evac_verified": false,
+    "last_evac_epoch": null,
+    "last_progress_epoch": null,
+    "last_epoch": null,
+    "experiments": [
+      {
+        "id": "<exp_id_1>",
+        "status": "pending",
+        "last_epoch": null,
+        "last_progress_epoch": null,
+        "retries": 0,
+        "local_metrics": "<artifact_dir>/<wave_id>/<exp_id_1>/metrics.json"
+      }
+    ],
+    "deadline": {
+      "final": "<DEADLINE_FINAL_ISO8601>",
+      "freeze": "<FREEZE_DATE>",
+      "rehearsal": "<REHEARSAL_DATE>",
+      "mode": "NORMAL"
+    },
+    "artifacts": {
+      "best_val": null,
+      "best_model": null,
+      "insurance_bundle": null,
+      "insurance_updated_at": null
+    },
+    "stop_reason": null,
+    "drive_copy": {
+      "enabled": false,
+      "consecutive_failures": 0
+    },
+    "daily_check_date": null
   }
 }

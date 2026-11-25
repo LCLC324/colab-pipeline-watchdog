@@ -1,23 +1,85 @@
-# colab-pipeline-watchdog
+# Bantou (番頭) — never-stall supervision for delegated work
 
-A reusable monitoring kit for long-running, deadline-bound work on Google Colab — designed so a pipeline never stalls silently.
+A unified supervision system for long-running delegated work — coding agents
+(agy, Claude Code) and multi-hour/multi-week Google Colab pipelines — designed
+so a delegation never stalls silently. Every stall ends in exactly one of two
+places: silent automatic recovery, or a single final-failure report.
 
-## What it is
+"Bantou" is the head clerk who runs the shop while the owner is away.
 
-Four parts that watch each other, plus an optional bounded autorepair:
+## How it works
 
-1. **State file** (`pipeline_state.json`) — the single source of truth: state-machine phase, per-experiment progress, deadline milestones, best artifact, a TTL lock, and the driver's last-run timestamp.
-2. **Single persistent driver** (cron, every 15 min) — the only actor allowed to start experiments. Each run takes the lock, advances the pipeline exactly one step (verify setup / judge progress by actual output growth / collect results locally / summarize and refresh the always-submittable insurance artifact / design and launch the next wave), and uploads a copy of the state file to Drive. It never deletes itself except at the terminal condition.
-3. **LLM-free watchdog** (a plain shell hook, poll 60s) — mechanically checks state-file freshness, per-phase dwell limits, driver staleness, session presence, and a missing insurance artifact, and alerts the owner directly. No LLM, on a different failure path than the driver. With autorepair it also watches the repair itself (overdue / stale tickets, one alert per escalation, the repairer cron disappearing) and extends stall limits only while a repair is fresh.
-4. **External eye** (Google Apps Script on a time trigger) — reads the state-file copy on Drive and emails the owner if updates stop. A dead man's switch that survives even if the whole local platform dies. A daily heartbeat file on Drive lets the driver confirm the external eye is still alive.
-5. **Autorepair (optional)** — a separate cron that picks up crashed experiments the driver has flagged, classifies the failure mechanically (auto-fix / fixed prescription / escalate to a human), asks a coding agent for a minimal diff only, passes it through a mechanical gate (allow-listed files, size cap, forbidden words, metrics keys preserved, patch dry-run) and local checks, and hands it back to the driver, which alone touches the Colab session and reruns the experiment. Hard limits per experiment, per wave, per day, and per ticket.
+Four parts, one of them code:
 
-## When to use it
+1. **State file** (one JSON per delegation) — the single source of truth:
+   phase (`running` / `done` / `failed`), attempts, the worker's systemd unit
+   name, the driver's heartbeat, restart timestamps. Written atomically
+   (temp file → `mv`).
+2. **Persistent driver** (a cron-run agent following a written body,
+   `driver_body.md`) — checks the worker's liveness *and* actual progress
+   (file/output growth, not process existence), restarts a hung worker a
+   bounded number of times, and reports only on completion or final failure.
+3. **Shared watchdog** (`watchdog/agy-delegation-watchdog.sh`, the only code) —
+   an LLM-free bash+python hook that polls every 5 minutes, stats the state
+   files of *all* delegations (target configs in `~/bantou/run/targets/`),
+   and wakes a recovery agent only on anomaly, on a bounded ladder
+   (3 wakes with cooldowns, then one final wake that reports). Terminal
+   phases are always silent. It also writes its own heartbeat, which the
+   drivers watch back — mutual monitoring.
+4. **Worker launcher** (`launch_worker.sh`) — starts each worker as a
+   **systemd transient unit**. This is load-bearing: processes spawned inside
+   a cron run are killed when that run ends, and neither `nohup` nor `setsid`
+   prevents it (verified by controlled experiment). A systemd unit survives.
+   The launcher passes the environment explicitly (systemd units do not
+   inherit it), records the exit status to `<log>.exit.json`, and stops the
+   whole unit cgroup on `systemctl stop`.
 
-Work that runs on Colab for hours to weeks, proceeds in stages or experiment "waves", and has a hard deadline where a silent stall costs real time (competition training, thesis experiments). Not worth it for one-off jobs that finish in minutes.
+## The Colab adapter
+
+For work that runs on Colab across hours/weeks under a hard deadline, the
+driver body and state file gain Colab-specific fields and checks
+(`templates/`): the ~3.3h session-reaping guard (evacuate at 2.5h, no new
+experiments at 3.0h), Drive evacuation verified *before* experiments start,
+progress judged by epoch growth, deadline countdown modes, and an
+always-submittable insurance artifact. An Apps Script "external eye" on
+Drive is an optional, detector-only add-on for VM-wide failure.
+Per-project watchdog scripts are retired — see `templates/legacy/` and
+`templates/SETUP_CHECKLIST_delta.md` for the migration.
+
+## Verification
+
+- `tests/run_tests.sh` — 48 desk assertions against the watchdog script
+  (sandboxed, fake clock): **48 passed, 0 failed**.
+- `REVIEW_carbon.md` — an independent review of the whole system by a second
+  model, which found 10 issues (3 high-severity silent blind spots) and
+  fixed them in place; the fixes are what the 48 tests cover.
+- The systemd launch route was proven by controlled experiment: workers
+  launched by `nohup`/`setsid` from inside a cron run died with the run;
+  the systemd-launched worker survived, and a hang-injection test confirmed
+  the driver detects, stops, and restarts a hung worker.
 
 ## Contents
 
-- `SKILL.md` — the full playbook: architecture, setup/teardown procedure, and the lessons behind each part.
-- `templates/` — fill-in templates for every part: `pipeline_state.template.json`, `driver_body.template.md`, `watchdog.template.sh`, `watchdog_definition.template.json`, `apps_script_code.gs.template`, `repairer_body.template.md`, `run_rerun.sh.template`, and `SETUP_CHECKLIST.md`.
-- `templates/run_rerun.sh.template` — the single-experiment rerun script used by autorepair: one experiment at a time (flock), refuses while the chain or another experiment runs, moves the previous train.log / metrics.json / error.json to `attempts/`, logs START / END rc= to rerun.log, and passes extra args through to the experiment script.
+- `DESIGN.md` — the canonical spec and contracts (§5 is the single source
+  of truth for state keys, launch/stop, terminal order, escalation).
+- `SKILL.md` — the operating playbook, including the launch gate: install
+  the state file, driver, and watchdog target *before* launching a worker.
+- `driver_body.md` — the generic driver template.
+- `launch_worker.sh` — the systemd worker launcher.
+- `watchdog/` — the shared watchdog script and its hook definition
+  (the definition targets the author's agent runtime; the script itself is
+  plain bash + python3).
+- `tests/run_tests.sh` — the watchdog test suite.
+- `REVIEW_carbon.md` — the independent review record.
+- `templates/` — the Colab adapter kit (driver body, state, target example,
+  setup checklist + migration delta, Apps Script template, optional
+  repairer), with the retired per-project watchdog under `legacy/`.
+
+In the documents, `~/bantou` is the system's home directory and
+`~/bantou/run` its runtime state directory; adapt both to your layout.
+
+## History
+
+This repository previously published the Colab-only kit ("colab-pipeline-
+watchdog"). Bantou is its successor: the Colab kit became the Colab adapter
+of one unified system that also supervises local agent delegations.
